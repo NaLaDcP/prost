@@ -17,6 +17,7 @@ use prost_types::{
 use crate::ast::{Comments, Method, Service};
 use crate::context::Context;
 use crate::ident::{strip_enum_prefix, to_snake, to_upper_camel};
+use crate::message_with_oneof_graphs::MessageOneOfPath;
 use crate::Config;
 
 mod c_escaping;
@@ -101,6 +102,14 @@ impl OneofField {
         }
         name
     }
+}
+
+struct UpwardFromStep {
+    parent_fq_name: String,
+    oneof_field_rust_name: String,
+    oneof_enum_ident: String,
+    variant_name: String,
+    boxed: bool,
 }
 
 impl<'b> CodeGenerator<'_, 'b> {
@@ -322,10 +331,15 @@ impl<'b> CodeGenerator<'_, 'b> {
         if self.config().enable_type_names {
             self.append_type_name(&message_name, &fq_message_name);
         }
+
+        if self.config().enable_oneof_conversions {
+            self.append_oneof_path_try_from_impls(&fq_message_name);
+            self.append_oneof_path_from_impls(&fq_message_name);
+        }
     }
 
     fn append_type_name(&mut self, message_name: &str, fq_message_name: &str) {
-        let prost_path = self.context.prost_path();
+        let prost_path = self.context.prost_path().to_string();
 
         self.buf.push_str(&format!(
             "impl {prost_path}::Name for {} {{\n",
@@ -361,6 +375,314 @@ impl<'b> CodeGenerator<'_, 'b> {
 
         self.depth -= 1;
         self.buf.push_str("}\n");
+    }
+
+    /// Generates `impl TryFrom<A> for B` for paths whose target is the current message.
+    ///
+    /// Each path comes from the oneof graph and represents a chain of oneof unwrappings.
+    fn append_oneof_path_try_from_impls(&mut self, fq_target_message_name: &str) {
+        let mut generated = HashSet::new();
+        for path in self.context.oneof_parent_paths_for_wrapped_messages() {
+            if let Some((source_fq_name, target_fq_name)) =
+                self.try_from_endpoints_for_path(&path, fq_target_message_name)
+            {
+                // Avoid duplicate impl generation when multiple equivalent paths are reported.
+                if generated.insert((source_fq_name.clone(), target_fq_name.clone())) {
+                    self.append_oneof_path_try_from_impl(&path, &source_fq_name, &target_fq_name);
+                }
+            }
+        }
+    }
+
+    /// Generates `impl From<A> for B` for upward paths whose target is the current message.
+    ///
+    /// This direction wraps values through oneof containers and is infallible.
+    fn append_oneof_path_from_impls(&mut self, fq_target_message_name: &str) {
+        let mut generated = HashSet::new();
+        for path in self.context.oneof_parent_paths_for_wrapped_messages() {
+            if let Some((source_fq_name, target_fq_name)) =
+                self.from_endpoints_for_upward_path(&path, fq_target_message_name)
+            {
+                if generated.insert((source_fq_name.clone(), target_fq_name.clone())) {
+                    self.append_oneof_path_from_impl(&path, &source_fq_name, &target_fq_name);
+                }
+            }
+        }
+    }
+
+    /// Returns `(source, target)` fully-qualified message names for a path
+    /// only when the path is usable for the target currently being generated.
+    fn try_from_endpoints_for_path(
+        &self,
+        path: &MessageOneOfPath,
+        fq_target_message_name: &str,
+    ) -> Option<(String, String)> {
+        if path.downward.len() < 2 {
+            return None;
+        }
+        let source_idx = path.downward.first().copied()?;
+        let target_idx = path.downward.last().copied()?;
+        let source_fq_name = self.context.oneof_graph_node_name(source_idx)?;
+        let target_fq_name = self.context.oneof_graph_node_name(target_idx)?;
+        if target_fq_name != fq_target_message_name {
+            return None;
+        }
+        Some((source_fq_name.to_owned(), target_fq_name.to_owned()))
+    }
+
+    /// Emits one full `TryFrom` impl for a single oneof path.
+    fn append_oneof_path_try_from_impl(
+        &mut self,
+        path: &MessageOneOfPath,
+        source_fq_name: &str,
+        target_fq_name: &str,
+    ) {
+        let source_ident = self.resolve_ident(source_fq_name);
+        let target_ident = self.resolve_ident(target_fq_name);
+        self.buf.push_str(&format!(
+            "impl ::core::convert::TryFrom<{source_ident}> for {target_ident} {{\n"
+        ));
+        self.depth += 1;
+        self.push_indent();
+        self.buf.push_str("type Error = ();\n");
+        self.push_indent();
+        self.buf.push_str(&format!(
+            "fn try_from(value: {source_ident}) -> ::core::result::Result<Self, Self::Error> {{\n"
+        ));
+        self.depth += 1;
+        self.push_indent();
+        self.buf.push_str("let step_0 = value;\n");
+
+        self.push_indent();
+        if self.append_oneof_path_try_from_steps(path) {
+            let last_step = path.downward.len() - 1;
+            self.buf.push_str(&format!("Ok(step_{last_step})\n"));
+        } else {
+            self.buf.push_str("Err(())\n");
+        }
+        self.depth -= 1;
+        self.push_indent();
+        self.buf.push_str("}\n");
+        self.depth -= 1;
+        self.buf.push_str("}\n");
+    }
+
+    /// Returns `(source, target)` for the upward direction of one path.
+    fn from_endpoints_for_upward_path(
+        &self,
+        path: &MessageOneOfPath,
+        fq_target_message_name: &str,
+    ) -> Option<(String, String)> {
+        if path.upward.len() < 2 {
+            return None;
+        }
+        let source_idx = path.upward.first().copied()?;
+        let target_idx = path.upward.last().copied()?;
+        let source_fq_name = self.context.oneof_graph_node_name(source_idx)?;
+        let target_fq_name = self.context.oneof_graph_node_name(target_idx)?;
+        if target_fq_name != fq_target_message_name {
+            return None;
+        }
+        Some((source_fq_name.to_owned(), target_fq_name.to_owned()))
+    }
+
+    /// Emits one `From` impl that wraps a leaf message through all oneof parents.
+    fn append_oneof_path_from_impl(
+        &mut self,
+        path: &MessageOneOfPath,
+        source_fq_name: &str,
+        target_fq_name: &str,
+    ) {
+        let Some(steps) = self.collect_upward_from_steps(path) else {
+            return;
+        };
+
+        let source_ident = self.resolve_ident(source_fq_name);
+        let target_ident = self.resolve_ident(target_fq_name);
+        self.buf.push_str(&format!(
+            "impl ::core::convert::From<{source_ident}> for {target_ident} {{\n"
+        ));
+        self.depth += 1;
+        self.push_indent();
+        self.buf
+            .push_str(&format!("fn from(value: {source_ident}) -> Self {{\n"));
+        self.depth += 1;
+        self.push_indent();
+        self.buf.push_str("let step_0 = value;\n");
+
+        let prost_path = self.context.prost_path().to_string();
+        for (step_idx, step) in steps.iter().enumerate() {
+            let parent_ident = self.resolve_ident(&step.parent_fq_name);
+            self.push_indent();
+            if step.boxed {
+                self.buf.push_str(&format!(
+                    "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}({}::alloc::boxed::Box::new(step_{}))), ..::core::default::Default::default() }};\n",
+                    step_idx + 1,
+                    parent_ident,
+                    step.oneof_field_rust_name,
+                    step.oneof_enum_ident,
+                    step.variant_name,
+                    prost_path,
+                    step_idx
+                ));
+            } else {
+                self.buf.push_str(&format!(
+                    "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}(step_{})), ..::core::default::Default::default() }};\n",
+                    step_idx + 1,
+                    parent_ident,
+                    step.oneof_field_rust_name,
+                    step.oneof_enum_ident,
+                    step.variant_name,
+                    step_idx
+                ));
+            }
+        }
+
+        self.push_indent();
+        self.buf.push_str(&format!("step_{}\n", steps.len()));
+        self.depth -= 1;
+        self.push_indent();
+        self.buf.push_str("}\n");
+        self.depth -= 1;
+        self.buf.push_str("}\n");
+    }
+
+    fn collect_upward_from_steps(&self, path: &MessageOneOfPath) -> Option<Vec<UpwardFromStep>> {
+        let mut steps = Vec::new();
+        for (step_idx, pair) in path.upward.windows(2).enumerate() {
+            let child_idx = pair[0];
+            let parent_idx = pair[1];
+
+            let child_fq_name = self.context.oneof_graph_node_name(child_idx)?;
+            let parent_fq_name = self.context.oneof_graph_node_name(parent_idx)?;
+            let oneof_fq_name = path.upward_oneof_variants.get(step_idx)?;
+            let oneof_name = oneof_fq_name.rsplit('.').next()?;
+            let parent_desc = self.context.get_message_descriptor(parent_fq_name)?;
+            let field =
+                self.oneof_field_linking_messages(parent_desc, oneof_name, child_fq_name)?;
+
+            steps.push(UpwardFromStep {
+                parent_fq_name: parent_fq_name.to_owned(),
+                oneof_field_rust_name: to_snake(oneof_name),
+                oneof_enum_ident: self.oneof_enum_ident(parent_fq_name, oneof_name, parent_desc),
+                variant_name: to_upper_camel(field.name()),
+                boxed: self
+                    .context
+                    .should_box_oneof_field(parent_fq_name, oneof_name, field),
+            });
+        }
+        Some(steps)
+    }
+
+    /// Emits step-by-step unwraps for the path.
+    ///
+    /// Returns `false` when metadata is incomplete (missing node/edge/field resolution).
+    fn append_oneof_path_try_from_steps(&mut self, path: &MessageOneOfPath) -> bool {
+        for (step_idx, pair) in path.downward.windows(2).enumerate() {
+            let parent_idx = pair[0];
+            let child_idx = pair[1];
+
+            let Some(parent_fq_name) = self.context.oneof_graph_node_name(parent_idx) else {
+                return false;
+            };
+            let Some(child_fq_name) = self.context.oneof_graph_node_name(child_idx) else {
+                return false;
+            };
+            let Some(oneof_fq_name) = path.downward_oneof_variants.get(step_idx) else {
+                return false;
+            };
+            let Some(oneof_name) = oneof_fq_name.rsplit('.').next() else {
+                return false;
+            };
+            let Some(parent_desc) = self.context.get_message_descriptor(parent_fq_name) else {
+                return false;
+            };
+
+            let Some(field) =
+                self.oneof_field_linking_messages(parent_desc, oneof_name, child_fq_name)
+            else {
+                return false;
+            };
+
+            let oneof_field_rust_name = to_snake(oneof_name);
+            let oneof_enum_ident = self.oneof_enum_ident(parent_fq_name, oneof_name, parent_desc);
+            let variant_name = to_upper_camel(field.name());
+            let boxed = self
+                .context
+                .should_box_oneof_field(parent_fq_name, oneof_name, field);
+
+            self.push_indent();
+            if boxed {
+                self.buf.push_str(&format!(
+                    "let step_{} = match step_{}.{} {{ Some({}::{}(v)) => *v, _ => return Err(()), }};\n",
+                    step_idx + 1,
+                    step_idx,
+                    oneof_field_rust_name,
+                    oneof_enum_ident,
+                    variant_name
+                ));
+            } else {
+                self.buf.push_str(&format!(
+                    "let step_{} = match step_{}.{} {{ Some({}::{}(v)) => v, _ => return Err(()), }};\n",
+                    step_idx + 1,
+                    step_idx,
+                    oneof_field_rust_name,
+                    oneof_enum_ident,
+                    variant_name
+                ));
+            }
+        }
+
+        true
+    }
+
+    /// Finds the field in `parent` that belongs to the given oneof and points to `child_fq_name`.
+    fn oneof_field_linking_messages<'a>(
+        &self,
+        parent: &'a DescriptorProto,
+        oneof_name: &str,
+        child_fq_name: &str,
+    ) -> Option<&'a FieldDescriptorProto> {
+        parent.field.iter().find(|field| {
+            let Some(index) = field.oneof_index else {
+                return false;
+            };
+            if field.type_name() != child_fq_name {
+                return false;
+            }
+            parent
+                .oneof_decl
+                .get(index as usize)
+                .is_some_and(|oneof| oneof.name() == oneof_name)
+        })
+    }
+
+    /// Computes the Rust enum type path for a oneof, including conflict handling (`*OneOf` suffix).
+    fn oneof_enum_ident(
+        &self,
+        parent_fq_message_name: &str,
+        oneof_name: &str,
+        parent: &DescriptorProto,
+    ) -> String {
+        let oneof_fq_name = format!("{parent_fq_message_name}.{oneof_name}");
+        let resolved = self.resolve_ident(&oneof_fq_name);
+
+        let mut type_name = to_upper_camel(oneof_name);
+        let has_type_name_conflict = parent
+            .nested_type
+            .iter()
+            .map(DescriptorProto::name)
+            .chain(parent.enum_type.iter().map(EnumDescriptorProto::name))
+            .any(|name| to_upper_camel(name) == type_name);
+        if has_type_name_conflict {
+            type_name.push_str("OneOf");
+        }
+
+        if let Some((prefix, _)) = resolved.rsplit_once("::") {
+            format!("{prefix}::{type_name}")
+        } else {
+            type_name
+        }
     }
 
     fn append_type_attributes(&mut self, fq_message_name: &str) {

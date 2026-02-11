@@ -1,12 +1,14 @@
 use std::borrow::Cow;
 
+use petgraph::graph::NodeIndex;
 use prost_types::{
     field_descriptor_proto::{Label, Type},
-    FieldDescriptorProto,
+    DescriptorProto, FieldDescriptorProto,
 };
 
 use crate::extern_paths::ExternPaths;
 use crate::message_graph::MessageGraph;
+use crate::message_with_oneof_graphs::{MessageOneOfPath, MessageWithOneofGraphs};
 use crate::{BytesType, Config, MapType, ServiceGenerator};
 
 /// The context providing all the global information needed to generate code.
@@ -18,6 +20,7 @@ use crate::{BytesType, Config, MapType, ServiceGenerator};
 pub struct Context<'a> {
     config: &'a mut Config,
     message_graph: MessageGraph,
+    message_with_oneof_graph: MessageWithOneofGraphs,
     extern_paths: ExternPaths,
     prost_path_attribute: Option<String>,
 }
@@ -26,6 +29,7 @@ impl<'a> Context<'a> {
     pub fn new(
         config: &'a mut Config,
         message_graph: MessageGraph,
+        message_with_oneof_graph: MessageWithOneofGraphs,
         extern_paths: ExternPaths,
     ) -> Self {
         let prost_path_attribute = config
@@ -36,6 +40,7 @@ impl<'a> Context<'a> {
         Self {
             config,
             message_graph,
+            message_with_oneof_graph,
             extern_paths,
             prost_path_attribute,
         }
@@ -313,5 +318,18 @@ impl<'a> Context<'a> {
             .type_name_domains
             .get_first(fq_message_name)
             .map_or("", |name| name.as_str())
+    }
+
+    pub fn oneof_parent_paths_for_wrapped_messages(&self) -> Vec<MessageOneOfPath> {
+        self.message_with_oneof_graph
+            .oneof_parent_paths_for_wrapped_messages()
+    }
+
+    pub fn oneof_graph_node_name(&self, node: NodeIndex) -> Option<&str> {
+        self.message_with_oneof_graph.node_name(node)
+    }
+
+    pub fn get_message_descriptor(&self, fq_message_name: &str) -> Option<&DescriptorProto> {
+        self.message_graph.get_message(fq_message_name)
     }
 }

@@ -18,6 +18,7 @@ use crate::code_generator::CodeGenerator;
 use crate::context::Context;
 use crate::extern_paths::ExternPaths;
 use crate::message_graph::MessageGraph;
+use crate::message_with_oneof_graphs::MessageWithOneofGraphs;
 use crate::path::PathMap;
 use crate::BytesType;
 use crate::MapType;
@@ -43,6 +44,7 @@ pub struct Config {
     pub(crate) extern_paths: Vec<(String, String)>,
     pub(crate) default_package_filename: String,
     pub(crate) enable_type_names: bool,
+    pub(crate) enable_oneof_conversions: bool,
     pub(crate) type_name_domains: PathMap<String>,
     pub(crate) protoc_args: Vec<OsString>,
     pub(crate) protoc_executable: PathBuf,
@@ -663,6 +665,14 @@ impl Config {
         self
     }
 
+    /// Configures the code generator to emit `From`/`TryFrom` conversions derived from oneof paths.
+    ///
+    /// Disabled by default.
+    pub fn enable_oneof_conversions(&mut self) -> &mut Self {
+        self.enable_oneof_conversions = true;
+        self
+    }
+
     /// Specify domain names to use with message type URLs.
     ///
     /// # Domains
@@ -1118,6 +1128,7 @@ impl Config {
         let mut packages = HashMap::new();
 
         let message_graph = MessageGraph::new(requests.iter().map(|x| &x.1));
+        let message_with_oneof_graph = MessageWithOneofGraphs::new(requests.iter().map(|x| &x.1));
         let extern_paths = ExternPaths::new(
             &self.extern_paths,
             self.prost_path_or_default(),
@@ -1125,7 +1136,7 @@ impl Config {
             self.prost_types,
         )
         .map_err(|error| Error::new(ErrorKind::InvalidInput, error))?;
-        let mut context = Context::new(self, message_graph, extern_paths);
+        let mut context = Context::new(self, message_graph, message_with_oneof_graph, extern_paths);
 
         for (request_module, request_fd) in requests {
             // Only record packages that have services
@@ -1209,6 +1220,7 @@ impl default::Default for Config {
             extern_paths: Vec::new(),
             default_package_filename: "_".to_string(),
             enable_type_names: false,
+            enable_oneof_conversions: false,
             type_name_domains: PathMap::default(),
             protoc_args: Vec::new(),
             protoc_executable: protoc_from_env(),
@@ -1240,6 +1252,7 @@ impl fmt::Debug for Config {
             .field("extern_paths", &self.extern_paths)
             .field("default_package_filename", &self.default_package_filename)
             .field("enable_type_names", &self.enable_type_names)
+            .field("enable_oneof_conversions", &self.enable_oneof_conversions)
             .field("type_name_domains", &self.type_name_domains)
             .field("protoc_args", &self.protoc_args)
             .field("disable_comments", &self.disable_comments)

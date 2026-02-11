@@ -151,6 +151,7 @@ mod context;
 mod extern_paths;
 mod ident;
 mod message_graph;
+pub mod message_with_oneof_graphs;
 mod path;
 
 mod config;
