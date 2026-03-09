@@ -1,8 +1,12 @@
 use std::collections::HashMap;
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 use petgraph::acyclic::Acyclic;
 use petgraph::algo::has_path_connecting;
 use petgraph::data::Build;
+use petgraph::dot::Dot;
 use petgraph::graph::NodeIndex;
 use petgraph::visit::EdgeRef;
 use petgraph::Direction;
@@ -49,7 +53,10 @@ pub struct MessageOneOfPath {
 }
 
 impl MessageWithOneofGraphs {
-    pub fn new<'a>(files: impl Iterator<Item = &'a FileDescriptorProto>) -> MessageWithOneofGraphs {
+    pub fn new<'a>(
+        files: impl Iterator<Item = &'a FileDescriptorProto>,
+        dot_file_name: Option<&str>,
+    ) -> MessageWithOneofGraphs {
         let mut msg_graph = MessageWithOneofGraphs {
             index: HashMap::new(),
             graph: Acyclic::new(),
@@ -67,6 +74,9 @@ impl MessageWithOneofGraphs {
             }
         }
 
+        if let Some(file_name) = dot_file_name {
+            let _ = msg_graph.write_dot(file_name);
+        }
         msg_graph
     }
 
@@ -134,36 +144,62 @@ impl MessageWithOneofGraphs {
         self.graph.edge_weight(edge).map(|kind| kind.value())
     }
 
-    /// Returns node indices for messages wrapped in a union:
-    /// at least one incoming `OneOf` edge and no outgoing `OneOf` edge.
-    pub fn message_wrapped_in_union_indices(&self) -> Vec<NodeIndex> {
-        let mut result = Vec::new();
-
-        for node in self.graph.node_indices() {
-            let has_incoming_oneof = self
-                .graph
-                .edges_directed(node, Direction::Incoming)
-                .any(|edge| matches!(edge.weight(), MessageOneOfEdge::OneOf(_)));
-            let has_outgoing_oneof = self
-                .graph
-                .edges_directed(node, Direction::Outgoing)
-                .any(|edge| matches!(edge.weight(), MessageOneOfEdge::OneOf(_)));
-
-            if has_incoming_oneof && !has_outgoing_oneof {
-                result.push(node);
-            }
-        }
-
-        result.sort_unstable_by_key(|idx| idx.index());
-        result
+    /// Returns all graph roots (nodes without incoming edges).
+    fn root_nodes(graph: &Acyclic<Graph<String, MessageOneOfEdge>>) -> Vec<NodeIndex> {
+        graph
+            .node_indices()
+            .filter(|&node| {
+                graph
+                    .neighbors_directed(node, Direction::Incoming)
+                    .next()
+                    .is_none()
+            })
+            .collect()
     }
 
-    /// For each wrapped message node, walks upward through incoming `OneOf` edges.
+    fn dfs(
+        &self,
+        current: NodeIndex,
+        current_path: &mut Vec<NodeIndex>,
+        current_oneof_variants: &mut Vec<String>,
+        paths: &mut Vec<(Vec<NodeIndex>, Vec<String>)>,
+    ) {
+        let outgoing_edges = self
+            .graph
+            .edges_directed(current, Direction::Outgoing)
+            .collect::<Vec<_>>();
+
+        if outgoing_edges.is_empty() {
+            paths.push((current_path.clone(), current_oneof_variants.clone()));
+            return;
+        }
+
+        if outgoing_edges
+            .iter()
+            .any(|edge| !matches!(edge.weight(), MessageOneOfEdge::OneOf(_)))
+        {
+            paths.push((current_path.clone(), current_oneof_variants.clone()));
+            return;
+        }
+
+        for edge in outgoing_edges {
+            let MessageOneOfEdge::OneOf(oneof_name) = edge.weight() else {
+                unreachable!("validated above");
+            };
+            let next = edge.target();
+            current_path.push(next);
+            current_oneof_variants.push(oneof_name.clone());
+            self.dfs(next, current_path, current_oneof_variants, paths);
+            current_oneof_variants.pop();
+            current_path.pop();
+        }
+    }
+
     ///
-    /// The traversal for one start node is cancelled if a node has more than one
-    /// incoming edge, or if its single incoming edge is not `OneOf`.
-    /// Parent re-encounter does not cancel the path; the walk stops after
-    /// recording that step to avoid infinite loops.
+    /// Traversal starts from root nodes (no incoming edges) and follows each
+    /// root branch in depth-first order.
+    /// A branch is stopped immediately when a node has more than one outgoing
+    /// edge, or when its unique outgoing edge is not `OneOf`.
     ///
     /// Each returned path carries:
     /// - node indices in both directions (`upward`/`downward`)
@@ -171,44 +207,23 @@ impl MessageWithOneofGraphs {
     pub fn oneof_parent_paths_for_wrapped_messages(&self) -> Vec<MessageOneOfPath> {
         let mut paths = Vec::new();
 
-        for start in self.message_wrapped_in_union_indices() {
-            let mut upward = vec![start];
-            let mut upward_oneof_variants = Vec::new();
-            let mut current = start;
-            let mut cancelled = false;
-
-            loop {
-                let incoming_edges: Vec<_> = self
-                    .graph
-                    .edges_directed(current, Direction::Incoming)
-                    .collect();
-
-                if incoming_edges.is_empty() {
-                    break;
+        for root in Self::root_nodes(&self.graph) {
+            let mut current_path = vec![root];
+            let mut current_oneof_variants = Vec::new();
+            let mut raw_paths = Vec::new();
+            self.dfs(
+                root,
+                &mut current_path,
+                &mut current_oneof_variants,
+                &mut raw_paths,
+            );
+            for (downward, downward_oneof_variants) in raw_paths {
+                if downward.len() < 2 {
+                    continue;
                 }
 
-                if incoming_edges.len() != 1 {
-                    cancelled = true;
-                    break;
-                }
-
-                let edge = incoming_edges[0];
-                let MessageOneOfEdge::OneOf(oneof_name) = edge.weight() else {
-                    cancelled = true;
-                    break;
-                };
-                let parent = edge.source();
-                upward.push(parent);
-                upward_oneof_variants.push(oneof_name.clone());
-                if upward[..upward.len() - 1].contains(&parent) {
-                    break;
-                }
-                current = parent;
-            }
-
-            if !cancelled {
-                let downward = upward.iter().rev().copied().collect();
-                let downward_oneof_variants = upward_oneof_variants.iter().rev().cloned().collect();
+                let upward = downward.iter().rev().copied().collect();
+                let upward_oneof_variants = downward_oneof_variants.iter().rev().cloned().collect();
                 paths.push(MessageOneOfPath {
                     upward,
                     downward,
@@ -219,6 +234,19 @@ impl MessageWithOneofGraphs {
         }
 
         paths
+    }
+
+    pub fn to_dot(&self) -> String {
+        format!("{:?}", Dot::new(&self.graph))
+    }
+
+    pub fn write_dot(&self, file_name: &str) -> io::Result<PathBuf> {
+        let out = std::env::var("OUT_DIR")
+            .map(PathBuf::from)
+            .map_err(|e| io::Error::new(io::ErrorKind::NotFound, e.to_string()))?;
+        let path = out.join(file_name);
+        fs::write(&path, self.to_dot())?;
+        Ok(path)
     }
 
     pub fn node_name(&self, node: NodeIndex) -> Option<&str> {

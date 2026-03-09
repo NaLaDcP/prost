@@ -15,6 +15,7 @@ use prost_types::{
 };
 
 use crate::ast::{Comments, Method, Service};
+use crate::config::OneofConversions;
 use crate::context::Context;
 use crate::ident::{strip_enum_prefix, to_snake, to_upper_camel};
 use crate::message_with_oneof_graphs::MessageOneOfPath;
@@ -110,6 +111,7 @@ struct UpwardFromStep {
     oneof_enum_ident: String,
     variant_name: String,
     boxed: bool,
+    can_omit_default: bool,
 }
 
 impl<'b> CodeGenerator<'_, 'b> {
@@ -332,7 +334,7 @@ impl<'b> CodeGenerator<'_, 'b> {
             self.append_type_name(&message_name, &fq_message_name);
         }
 
-        if self.config().enable_oneof_conversions {
+        if self.config().oneof_conversions != OneofConversions::Disabled {
             self.append_oneof_path_try_from_impls(&fq_message_name);
             self.append_oneof_path_from_impls(&fq_message_name);
         }
@@ -440,14 +442,14 @@ impl<'b> CodeGenerator<'_, 'b> {
         let source_ident = self.resolve_ident(source_fq_name);
         let target_ident = self.resolve_ident(target_fq_name);
         self.buf.push_str(&format!(
-            "impl ::core::convert::TryFrom<{source_ident}> for {target_ident} {{\n"
+            "impl<'a> ::core::convert::TryFrom<&'a {source_ident}> for &'a {target_ident} {{\n"
         ));
         self.depth += 1;
         self.push_indent();
         self.buf.push_str("type Error = ();\n");
         self.push_indent();
         self.buf.push_str(&format!(
-            "fn try_from(value: {source_ident}) -> ::core::result::Result<Self, Self::Error> {{\n"
+            "fn try_from(value: &'a {source_ident}) -> ::core::result::Result<Self, Self::Error> {{\n"
         ));
         self.depth += 1;
         self.push_indent();
@@ -512,34 +514,103 @@ impl<'b> CodeGenerator<'_, 'b> {
 
         let prost_path = self.context.prost_path().to_string();
         for (step_idx, step) in steps.iter().enumerate() {
+            let is_last = step_idx + 1 == steps.len();
             let parent_ident = self.resolve_ident(&step.parent_fq_name);
             self.push_indent();
             if step.boxed {
-                self.buf.push_str(&format!(
-                    "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}({}::alloc::boxed::Box::new(step_{}))), ..::core::default::Default::default() }};\n",
-                    step_idx + 1,
-                    parent_ident,
-                    step.oneof_field_rust_name,
-                    step.oneof_enum_ident,
-                    step.variant_name,
-                    prost_path,
-                    step_idx
-                ));
+                if is_last {
+                    if step.can_omit_default {
+                        self.buf.push_str(&format!(
+                            "{} {{ {}: ::core::option::Option::Some({}::{}({}::alloc::boxed::Box::new(step_{}))) }}\n",
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            prost_path,
+                            step_idx
+                        ));
+                    } else {
+                        self.buf.push_str(&format!(
+                            "{} {{ {}: ::core::option::Option::Some({}::{}({}::alloc::boxed::Box::new(step_{}))), ..::core::default::Default::default() }}\n",
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            prost_path,
+                            step_idx
+                        ));
+                    }
+                } else {
+                    if step.can_omit_default {
+                        self.buf.push_str(&format!(
+                            "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}({}::alloc::boxed::Box::new(step_{}))) }};\n",
+                            step_idx + 1,
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            prost_path,
+                            step_idx
+                        ));
+                    } else {
+                        self.buf.push_str(&format!(
+                            "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}({}::alloc::boxed::Box::new(step_{}))), ..::core::default::Default::default() }};\n",
+                            step_idx + 1,
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            prost_path,
+                            step_idx
+                        ));
+                    }
+                }
             } else {
-                self.buf.push_str(&format!(
-                    "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}(step_{})), ..::core::default::Default::default() }};\n",
-                    step_idx + 1,
-                    parent_ident,
-                    step.oneof_field_rust_name,
-                    step.oneof_enum_ident,
-                    step.variant_name,
-                    step_idx
-                ));
+                if is_last {
+                    if step.can_omit_default {
+                        self.buf.push_str(&format!(
+                            "{} {{ {}: ::core::option::Option::Some({}::{}(step_{})) }}\n",
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            step_idx
+                        ));
+                    } else {
+                        self.buf.push_str(&format!(
+                            "{} {{ {}: ::core::option::Option::Some({}::{}(step_{})), ..::core::default::Default::default() }}\n",
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            step_idx
+                        ));
+                    }
+                } else {
+                    if step.can_omit_default {
+                        self.buf.push_str(&format!(
+                            "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}(step_{})) }};\n",
+                            step_idx + 1,
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            step_idx
+                        ));
+                    } else {
+                        self.buf.push_str(&format!(
+                            "let step_{} = {} {{ {}: ::core::option::Option::Some({}::{}(step_{})), ..::core::default::Default::default() }};\n",
+                            step_idx + 1,
+                            parent_ident,
+                            step.oneof_field_rust_name,
+                            step.oneof_enum_ident,
+                            step.variant_name,
+                            step_idx
+                        ));
+                    }
+                }
             }
         }
-
-        self.push_indent();
-        self.buf.push_str(&format!("step_{}\n", steps.len()));
         self.depth -= 1;
         self.push_indent();
         self.buf.push_str("}\n");
@@ -569,6 +640,7 @@ impl<'b> CodeGenerator<'_, 'b> {
                 boxed: self
                     .context
                     .should_box_oneof_field(parent_fq_name, oneof_name, field),
+                can_omit_default: parent_desc.field.len() == 1,
             });
         }
         Some(steps)
@@ -614,7 +686,7 @@ impl<'b> CodeGenerator<'_, 'b> {
             self.push_indent();
             if boxed {
                 self.buf.push_str(&format!(
-                    "let step_{} = match step_{}.{} {{ Some({}::{}(v)) => *v, _ => return Err(()), }};\n",
+                    "let step_{} = match step_{}.{}.as_ref() {{ Some({}::{}(v)) => v.as_ref(), _ => return Err(()), }};\n",
                     step_idx + 1,
                     step_idx,
                     oneof_field_rust_name,
@@ -623,7 +695,7 @@ impl<'b> CodeGenerator<'_, 'b> {
                 ));
             } else {
                 self.buf.push_str(&format!(
-                    "let step_{} = match step_{}.{} {{ Some({}::{}(v)) => v, _ => return Err(()), }};\n",
+                    "let step_{} = match step_{}.{}.as_ref() {{ Some({}::{}(v)) => v, _ => return Err(()), }};\n",
                     step_idx + 1,
                     step_idx,
                     oneof_field_rust_name,

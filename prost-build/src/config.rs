@@ -25,6 +25,27 @@ use crate::MapType;
 use crate::Module;
 use crate::ServiceGenerator;
 
+/// Controls oneof conversion generation and optional DOT graph output.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum OneofConversions {
+    /// Do not generate oneof conversions.
+    #[default]
+    Disabled,
+    /// Generate oneof `From`/`TryFrom` conversions.
+    Enabled,
+    /// Generate oneof conversions and write a DOT graph to `OUT_DIR/file_name`.
+    EnabledWithDotFile { file_name: String },
+}
+
+impl OneofConversions {
+    fn dot_file_name(&self) -> Option<&str> {
+        match self {
+            Self::Disabled | Self::Enabled => None,
+            Self::EnabledWithDotFile { file_name } => Some(file_name),
+        }
+    }
+}
+
 /// Configuration options for Protobuf code generation.
 ///
 /// This configuration builder can be used to set non-default code generation options.
@@ -44,7 +65,7 @@ pub struct Config {
     pub(crate) extern_paths: Vec<(String, String)>,
     pub(crate) default_package_filename: String,
     pub(crate) enable_type_names: bool,
-    pub(crate) enable_oneof_conversions: bool,
+    pub(crate) oneof_conversions: OneofConversions,
     pub(crate) type_name_domains: PathMap<String>,
     pub(crate) protoc_args: Vec<OsString>,
     pub(crate) protoc_executable: PathBuf,
@@ -665,11 +686,11 @@ impl Config {
         self
     }
 
-    /// Configures the code generator to emit `From`/`TryFrom` conversions derived from oneof paths.
+    /// Configures oneof conversion generation mode.
     ///
     /// Disabled by default.
-    pub fn enable_oneof_conversions(&mut self) -> &mut Self {
-        self.enable_oneof_conversions = true;
+    pub fn enable_oneof_conversions(&mut self, oneof_conversions: OneofConversions) -> &mut Self {
+        self.oneof_conversions = oneof_conversions;
         self
     }
 
@@ -1128,7 +1149,9 @@ impl Config {
         let mut packages = HashMap::new();
 
         let message_graph = MessageGraph::new(requests.iter().map(|x| &x.1));
-        let message_with_oneof_graph = MessageWithOneofGraphs::new(requests.iter().map(|x| &x.1));
+        let dot_file_name = self.oneof_conversions.dot_file_name();
+        let message_with_oneof_graph =
+            MessageWithOneofGraphs::new(requests.iter().map(|x| &x.1), dot_file_name);
         let extern_paths = ExternPaths::new(
             &self.extern_paths,
             self.prost_path_or_default(),
@@ -1220,7 +1243,7 @@ impl default::Default for Config {
             extern_paths: Vec::new(),
             default_package_filename: "_".to_string(),
             enable_type_names: false,
-            enable_oneof_conversions: false,
+            oneof_conversions: OneofConversions::Disabled,
             type_name_domains: PathMap::default(),
             protoc_args: Vec::new(),
             protoc_executable: protoc_from_env(),
@@ -1252,7 +1275,7 @@ impl fmt::Debug for Config {
             .field("extern_paths", &self.extern_paths)
             .field("default_package_filename", &self.default_package_filename)
             .field("enable_type_names", &self.enable_type_names)
-            .field("enable_oneof_conversions", &self.enable_oneof_conversions)
+            .field("oneof_conversions", &self.oneof_conversions)
             .field("type_name_domains", &self.type_name_domains)
             .field("protoc_args", &self.protoc_args)
             .field("disable_comments", &self.disable_comments)
